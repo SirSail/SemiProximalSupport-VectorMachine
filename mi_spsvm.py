@@ -1,362 +1,517 @@
+"""
+MI-SPSVM: Semi-Proximal Support Vector Machine for Multiple Instance Learning
+
+This implementation follows the exact algorithm specification from project79.pdf:
+- Mixed L2 loss (positive) / L1 loss (negative)
+- Proper J+/J- set iteration scheme
+- cvxopt QP solver
+
+Author: Optimization for ML Course Project 79
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
-from typing import List, Tuple, Optional, cast
+from typing import Tuple, cast
+import re
 import sys
 
-# Type aliases for clarity
+# Type aliases
 Vector = np.ndarray
 Matrix = np.ndarray
 
-class SPSVM:
-    """
-    Smooth Proximal Support Vector Machine (SPSVM) - Primal solver.
-    Minimizes: 0.5 * w'w + 0.5 * C * ||(1 - D(Aw - e*gamma))_+||^2
-    Here we ignore bias 'b' (gamma) for simplicity or include it in weights.
-    For this implementation, we will include bias in the weight vector by appending a 1 column to X.
-    """
-    def __init__(self, C: float = 1.0, max_iter: int = 100, tol: float = 1e-3, verbose: bool = False) -> None:
-        self.C = C
-        self.max_iter = max_iter
-        self.tol = tol
-        self.verbose = verbose
-        self.w: Optional[Vector] = None
 
-    def fit(self, X: Matrix, y: Vector) -> 'SPSVM':
-        """
-        X: (n_samples, n_features)
-        y: (n_samples, )
-        """
-        n, d = X.shape
-        # Augment X with 1s for bias term
-        X_aug = np.hstack([X, np.ones((n, 1))])
-        d_aug = d + 1
-        
-        # Initial weights
-        w = np.zeros(d_aug)
-        
-        # D matrix (diagonal labeling matrix), effectively we can just multiply rows of X
-        # Optimization objective function f(w)
-        # Gradient grad_f(w)
-        # Hessian hess_f(w)
-        
-        for i in range(self.max_iter):
-            # Calculate margin: D(Xw) where D is diag(y)
-            # Since y is {-1, 1}, we can just do y * (X @ w)
-            linear_output = X_aug @ w
-            margin = y * linear_output
-            
-            # Error vector e = (1 - margin)_+
-            error_raw = 1 - margin
-            error_vec = np.maximum(0, error_raw)
-            
-            # Objective function value (primal)
-            # obj = 0.5 * w.T @ w + 0.5 * C * error_vec.T @ error_vec
-            
-            if np.linalg.norm(error_vec) < self.tol:
-                if self.verbose:
-                    print(f"Converged at iter {i}")
-                break
-
-            # Gradient calculation
-            # grad = w - C * X^T D * I_sv * (1 - D X w)
-            # where I_sv is indicator of support vectors (error > 0)
-            # Let's simplify:
-            # The derivative of 0.5*C*||(1 - Dw^T x)||^2 is -C * sum_{sv} y_i * x_i * (1 - y_i w^T x_i)
-            # which is -C * X^T * (y * error_vec) ? 
-            # Actually simpler: let r = (1 - DyXw)_+. 
-            # Loss = 0.5 * C * r^T r
-            # Grad_Loss = - C * X^T D r
-            # because d/dw (1 - y_i x_i^T w) = -y_i x_i
-            
-            # Support vector indices where 1 - y(wTx) > 0
-            sv_indices = error_raw > 0
-            
-            # Gradient
-            # term2 = X_aug.T @ (y * error_vec)  <-- wait, error_vec already has zeroes where not SV
-            # But the sign: loss is increasing with error.
-            # grad = w + C * X_aug.T @ ( -y * error_vec ) is INCORRECT derivation direction.
-            # Correct derivation:
-            # f(w) = 0.5 w'w + 0.5 C || (1 - D A w)_+ ||^2
-            # Let v = (1 - D A w). P(v) = v_+
-            # Grad = w + C * (d/dw v) * v_+
-            # d/dw v = - (D A)^T
-            # Grad = w - C * A^T D * v_+ 
-            #      = w - C * A^T * (y * error_vec)
-            
-            grad = w - self.C * (X_aug.T @ (y * error_vec))
-            
-            # Hessian calculation (generalized Hessian)
-            # H = I + C * X^T D I_sv D X
-            # Since D*D = I, H = I + C * X_{sv}^T X_{sv}
-            
-            X_sv = X_aug[sv_indices]
-            hess = np.eye(d_aug) + self.C * (X_sv.T @ X_sv)
-            
-            # Newton step: w_new = w - H^-1 grad
-            # To avoid inversion, solve H d = -grad
-            try:
-                step = np.linalg.solve(hess, -grad)
-            except np.linalg.LinAlgError:
-                # Fallback to gradient descent if singular
-                step = -0.01 * grad
-            
-            # Simple armijo line search could be added here, but full step usually works for SPSVM
-            w = w + step
-            
-            if np.linalg.norm(step) < self.tol:
-                if self.verbose:
-                    print(f"Items converged at {i}")
-                break
-                
-        self.w = w
-        return self
-
-    def predict(self, X: Matrix) -> Vector:
-        if self.w is None:
-            raise ValueError("Model not fitted")
-        n = X.shape[0]
-        X_aug = np.hstack([X, np.ones((n, 1))])
-        scores = X_aug @ self.w
-        return cast(Vector, np.sign(scores))
-
-    def decision_function(self, X: Matrix) -> Vector:
-        if self.w is None:
-            raise ValueError("Model not fitted")
-        n = X.shape[0]
-        X_aug = np.hstack([X, np.ones((n, 1))])
-        return cast(Vector, X_aug @ self.w)
+def load_octave_mat(filepath: str) -> dict[str, np.ndarray]:
+    """Parse Octave text format .mat file."""
+    with open(filepath, 'r') as f:
+        content = f.read()
     
+    data: dict[str, np.ndarray] = {}
+    
+    # Pattern to match variable blocks
+    pattern = r'# name: (\w+)\n# type: (\w+)\n(?:# rows: (\d+)\n# columns: (\d+)\n)?([\s\S]*?)(?=\n\n# name:|$)'
+    matches = re.findall(pattern, content)
+    
+    for match in matches:
+        name, dtype, rows, cols, values = match
+        values = values.strip()
+        
+        if dtype == 'scalar':
+            data[name] = np.array([float(values)])
+        elif dtype == 'matrix':
+            rows_int = int(rows)
+            cols_int = int(cols)
+            numbers = [float(x) for x in values.split()]
+            arr = np.array(numbers).reshape(rows_int, cols_int)
+            data[name] = arr
+    
+    return data
 
 
-
-class MISPSVM:
+def solve_mi_spsvm_qp(
+    X: Matrix,
+    J_plus: list[int],
+    J_minus: list[int],
+    C: float = 1.0
+) -> Tuple[Vector, float]:
     """
-    Multiple Instance Learning wrapper around SPSVM.
-    Algorithm:
-    1. Initialize: Assign y_i = Y_I for all instances in bag I.
-    2. Loop:
-       a. Train SPSVM on all instances with current labels.
-       b. Update labels: For each positive bag, select instance with max score. 
-          Set that to +1, others to -1. Negative bags all -1.
-       c. Check convergence.
+    Solve the mi-SPSVM optimization problem:
+    
+    min  0.5 * ||(v, gamma)||^2 + (C/2) * sum_{j in J+} xi_j^2 + C * sum_{j in J-} xi_j
+    s.t. xi_j = 1 - (v^T x_j - gamma)   for j in J+
+         xi_j >= 1 + (v^T x_j - gamma)  for j in J-
+         xi_j >= 0                      for j in J-
+    
+    This is a QP problem. We reformulate:
+    - For J+: equality constraint, L2 penalty -> substitute xi into objective
+    - For J-: inequality constraints, L1 penalty -> use slack formulation
+    
+    Returns:
+        v: weight vector (n_features,)
+        gamma: bias term
     """
-    def __init__(self, C: float = 1.0, max_iter: int = 10, verbose: bool = False) -> None:
+    try:
+        from cvxopt import matrix, solvers  # type: ignore[import-untyped]
+        solvers.options['show_progress'] = False
+    except ImportError:
+        print("cvxopt not installed. Using fallback Newton solver.")
+        return _solve_newton_fallback(X, J_plus, J_minus, C)
+    
+    n_features = X.shape[1]  # 2
+    n_plus = len(J_plus)
+    n_minus = len(J_minus)
+    
+    # Decision variables: [v (n_features), gamma (1), xi_minus (n_minus)]
+    # Total: n_features + 1 + n_minus
+    n_vars = n_features + 1 + n_minus
+    
+    # Build the QP matrices
+    # Objective: 0.5 * z^T P z + q^T z
+    
+    # For positive instances, substitute xi_j = 1 - (v^T x_j - gamma)
+    # Loss_plus = (C/2) * sum_j (1 - v^T x_j + gamma)^2
+    # This adds quadratic terms in (v, gamma)
+    
+    # Let's expand: sum_j (1 - v^T x_j + gamma)^2
+    # = sum_j (1 + gamma - v^T x_j)^2
+    # = sum_j [(1+gamma)^2 - 2(1+gamma)(v^T x_j) + (v^T x_j)^2]
+    
+    # Build X_plus: (n_plus, n_features)
+    X_plus = X[J_plus, :]  # Shape: (n_plus, n_features)
+    
+    # The quadratic part from positive instances:
+    # (C/2) * v^T (X_plus^T X_plus) v - C * v^T X_plus^T (1+gamma) + (C/2)*n_plus*(1+gamma)^2
+    # But since gamma is also a variable, we need to be careful
+    
+    # Let's use augmented representation for cleaner formulation
+    # Define z = [v; gamma; xi_minus]
+    # 
+    # For positive loss (L2):
+    # xi_j^+ = 1 - v^T x_j + gamma
+    # Loss_plus = (C/2) * ||e - X_plus @ v + gamma * 1||^2
+    #           where e = ones(n_plus)
+    # 
+    # Let A_plus = [X_plus, -ones(n_plus,1)]  (shape: n_plus x (n+1))
+    # Then xi_plus = e - A_plus @ [v; gamma] = e + [-X_plus, ones] @ [v; gamma]
+    # Wait, let me be more careful with signs.
+    # xi_j = 1 - (v^T x_j - gamma) = 1 - v^T x_j + gamma
+    
+    # Let's define:
+    # A = [X_plus, -ones]  shape (n_plus, n+1)
+    # b = ones(n_plus)
+    # xi_plus = b - A @ [v; gamma] with A = [X_plus, -ones]
+    # = 1 - v^T x_j + gamma  ✓
+    
+    A_plus = np.hstack([X_plus, -np.ones((n_plus, 1))])  # (n_plus, n+1)
+    b_plus = np.ones(n_plus)
+    
+    # Loss_plus = (C/2) * ||b_plus - A_plus @ w||^2  where w = [v; gamma]
+    # = (C/2) * [w^T A_plus^T A_plus w - 2 b_plus^T A_plus w + b_plus^T b_plus]
+    
+    # Quadratic term from positive loss:
+    AtA_plus = A_plus.T @ A_plus  # (n+1, n+1)
+    Atb_plus = A_plus.T @ b_plus  # (n+1,)
+    
+    # Build P matrix (Hessian)
+    # P = diag([1,...,1, 1, 0,...,0]) + C * [AtA_plus, 0; 0, 0]
+    #     ^-- v      ^-- gamma ^-- xi_minus
+    
+    P = np.zeros((n_vars, n_vars))
+    # Regularization: 0.5 * (v^T v + gamma^2) -> I for first (n+1) vars
+    P[:n_features+1, :n_features+1] = np.eye(n_features + 1)
+    # Positive loss quadratic term
+    P[:n_features+1, :n_features+1] += C * AtA_plus
+    
+    # Build q vector (linear term)
+    # q = [0,...,0] - C * [Atb_plus; 0,...,0]
+    # Actually for quadratic expansion: -C * Atb_plus for (v, gamma)
+    # And +C for each xi_minus (L1 penalty)
+    q = np.zeros(n_vars)
+    q[:n_features+1] = -C * Atb_plus
+    q[n_features+1:] = C  # L1 penalty coefficients for xi_minus
+    
+    # Inequality constraints: Gz <= h
+    # For j in J-:
+    #   xi_j >= 1 + v^T x_j - gamma   =>  -xi_j + v^T x_j - gamma <= -1
+    #   xi_j >= 0                      =>  -xi_j <= 0
+    
+    X_minus = X[J_minus, :]  # (n_minus, n_features)
+    
+    # First set of constraints: -xi + v^T x - gamma <= -1
+    # Variables: [v, gamma, xi_minus]
+    # G1 @ z = [X_minus, -ones, -I] @ [v; gamma; xi] <= -1
+    G1 = np.zeros((n_minus, n_vars))
+    G1[:, :n_features] = X_minus
+    G1[:, n_features] = -1  # gamma coefficient
+    G1[:, n_features+1:] = -np.eye(n_minus)  # xi coefficients
+    h1 = -np.ones(n_minus)
+    
+    # Second set: -xi <= 0
+    G2 = np.zeros((n_minus, n_vars))
+    G2[:, n_features+1:] = -np.eye(n_minus)
+    h2 = np.zeros(n_minus)
+    
+    G = np.vstack([G1, G2])
+    h = np.hstack([h1, h2])
+    
+    # Convert to cvxopt format
+    P_cvx = matrix(P, tc='d')
+    q_cvx = matrix(q, tc='d')
+    G_cvx = matrix(G, tc='d')
+    h_cvx = matrix(h, tc='d')
+    
+    # Solve QP
+    sol = solvers.qp(P_cvx, q_cvx, G_cvx, h_cvx)
+    
+    if sol['status'] != 'optimal':
+        print(f"Warning: QP solver status = {sol['status']}")
+    
+    z = np.array(sol['x']).flatten()
+    v = z[:n_features]
+    gamma = z[n_features]
+    
+    return v, gamma
+
+
+def _solve_newton_fallback(
+    X: Matrix,
+    J_plus: list[int],
+    J_minus: list[int],
+    C: float
+) -> Tuple[Vector, float]:
+    """Fallback Newton solver if cvxopt is not available."""
+    n_features = X.shape[1]
+    
+    # Simple gradient descent on smooth approximation
+    w = np.zeros(n_features + 1)  # [v; gamma]
+    lr = 0.01
+    
+    for _ in range(1000):
+        # Positive loss gradient (L2)
+        grad = np.copy(w)
+        for j in J_plus:
+            x_aug = np.append(X[j], -1)  # [x; -1] for v^T x - gamma
+            xi = 1 - w @ x_aug
+            grad -= C * xi * x_aug
+        
+        # Negative loss gradient (L1 -> subgradient)
+        for j in J_minus:
+            x_aug = np.append(X[j], -1)
+            margin = w @ x_aug  # v^T x - gamma
+            if margin < -1:  # xi = 1 + margin > 0
+                grad += C * x_aug
+        
+        w -= lr * grad
+        
+        if np.linalg.norm(grad) < 1e-6:
+            break
+    
+    return w[:n_features], w[n_features]
+
+
+class MiSPSVM:
+    """
+    mi-SPSVM: Semi-Proximal SVM for Multiple Instance Learning.
+    
+    Implements the exact algorithm from project79.pdf:
+    - Step 0: Initialize J+ and J-
+    - Step 1: Solve semiproximal QP
+    - Step 2: Stopping criterion (witness selection)
+    - Step 3: Update J+ and J-
+    - Step 4: Iterate
+    """
+    
+    def __init__(self, C: float = 1.0, max_iter: int = 100, verbose: bool = False) -> None:
         self.C = C
         self.max_iter = max_iter
         self.verbose = verbose
-        self.svm = SPSVM(C=C, verbose=verbose)
-        self.final_w: Optional[Vector] = None
-
-    def fit(self, bags: List[Matrix], bag_labels: Vector) -> 'MISPSVM':
+        self.v: Vector | None = None
+        self.gamma: float = 0.0
+        self.history: list[dict[str, object]] = []
+    
+    def fit(
+        self,
+        X: Matrix,
+        instance_bag: Vector,
+        bag_labels: Vector
+    ) -> 'MiSPSVM':
         """
-        bags: List of numpy arrays, each (n_instances_in_bag, n_features)
-        bag_labels: (n_bags, ) -1 or 1
+        Fit the mi-SPSVM model.
+        
+        Args:
+            X: (n_instances, n_features) instance feature matrix
+            instance_bag: (n_instances,) bag assignment for each instance
+            bag_labels: (n_bags,) labels for each bag (+1 or -1)
         """
-        # Flatten everything for easier indexing
-        # But we need to keep track of which instance belongs to which bag
+        n_instances = X.shape[0]
+        n_bags = len(bag_labels)
         
-        # Initial labeling: propagate bag label to all instances
-        instance_vars = []
-        instance_bag_map = []
+        # Identify positive and negative bags
+        pos_bags = [i+1 for i in range(n_bags) if bag_labels[i] == 1]  # 1-indexed
+        neg_bags = [i+1 for i in range(n_bags) if bag_labels[i] == -1]
         
-        current_labels = []
+        if self.verbose:
+            print(f"Positive bags: {pos_bags}")
+            print(f"Negative bags: {neg_bags}")
         
-        for idx, (bag, label) in enumerate(zip(bags, bag_labels)):
-            n_inst = bag.shape[0]
-            instance_vars.append(bag)
-            instance_bag_map.extend([idx] * n_inst)
-            
-            # Heuristic initialization: align with bag label
-            current_labels.extend([label] * n_inst)
-            
-        X_all = np.vstack(instance_vars)
-        y_all = np.array(current_labels, dtype=float)
-        bag_map = np.array(instance_bag_map)
+        # Step 0: Initialize J+ and J-
+        # J+ = all instances in positive bags
+        # J- = all instances in negative bags
+        J_plus: list[int] = []
+        J_minus: list[int] = []
         
-        # Indices of positive bags
-        pos_bag_indices = np.where(bag_labels == 1)[0]
-        
-        prev_y = np.copy(y_all)
-        
-        for it in range(self.max_iter):
-            # Step A: Train SVM
-            self.svm.fit(X_all, y_all)
-            
-            # Step B: Re-assign labels
-            # Calculate scores for all instances
-            scores = self.svm.decision_function(X_all)
-            
-            # Reset positive bag instances to -1 first?
-            # Standard mi-SVM:
-            # For negative bags, all instances are -1 (fixed).
-            # For positive bags, find instance with max score -> +1, others -> -1 ?
-            # OR others -> remain valid?
-            # "mi-SVM" formulation:
-            # s.t. sum_{i in I} (y_i+1)/2 >= 1  (at least one positive)
-            # Heuristic: set all y_i = sgn(w^T x_i), but ensure at least one is +1
-            
-            # Let's use the max-score heuristic:
-            # For each positive bag:
-            #   Find instance with max w^T x.
-            #   Set its label to 1.
-            #   Set others to sign(w^T x) ... or -1?
-            #   Usually: others are determined by the classifier, but subject to the constraint.
-            #   Common simple heuristic: select the 'witness' (max score) as +1. 
-            #   What about the others? If we treat them as unlabeled, it's semi-supervised.
-            #   If we treat them as negative, it's the "witness" approach.
-            #   Let's stick to: "At least one is positive".
-            #   Update rule: For pos bag, y_i = sgn(w^T x) EXCEPT if all are -1, force max to +1.
-            
-            new_y = np.copy(y_all)
-            
-            for b_idx in pos_bag_indices:
-                # Get indices in X_all for this bag
-                indices = np.where(bag_map == b_idx)[0]
-                
-                bag_scores = scores[indices]
-                
-                # Default update: just follow the classifier sign
-                bag_inst_labels = np.sign(bag_scores)
-                
-                # Consistency check: At least one must be +1
-                if not np.any(bag_inst_labels == 1):
-                    # Force the max score instance to be positive
-                    max_idx_local = np.argmax(bag_scores)
-                    bag_inst_labels[max_idx_local] = 1.0
-                
-                new_y[indices] = bag_inst_labels
-            
-            # Negative bags are always all -1
-            neg_indices = np.where(np.isin(bag_map, np.where(bag_labels == -1)[0]))[0]
-            new_y[neg_indices] = -1.0
-            
-            # Check convergence
-            if np.array_equal(new_y, prev_y):
-                if self.verbose:
-                    print(f"MI-SPSVM Converged at outer iter {it}")
-                break
-                
-            y_all = new_y
-            prev_y = np.copy(new_y)
-            
-        self.final_w = self.svm.w
-        return self
-
-    def predict_bag(self, bags: List[Matrix]) -> Vector:
-        if self.final_w is None:
-            raise ValueError("Not fitted")
-            
-        preds = []
-        for bag in bags:
-            # Max pooling assumption
-            scores = self.svm.decision_function(bag)
-            if np.max(scores) > 0:
-                preds.append(1.0)
+        for j in range(n_instances):
+            bag_id = int(instance_bag[j])
+            if bag_id in pos_bags:
+                J_plus.append(j)
             else:
-                preds.append(-1.0)
-        return np.array(preds, dtype=np.float64)
-
-
-def generate_data(n_bags: int = 50, seed: int = 42) -> Tuple[List[Matrix], Vector]:
-    np.random.seed(seed)
-    bags = []
-    labels = []
-    
-    # Positive bags have at least one instance from Positive distribution
-    # Negative bags have all instances from Negative distribution
-    
-    # Dist 1 (Neg): centered at (-2, -2)
-    # Dist 2 (Pos): centered at (2, 2)
-    
-    for _ in range(n_bags):
-        n_instances = np.random.randint(3, 10)
-        label = 1 if np.random.rand() > 0.5 else -1
+                J_minus.append(j)
         
-        instances = []
-        if label == 1:
-            # At least one positive instance
-            n_pos = np.random.randint(1, n_instances + 1)
-            # Some positive instances
-            pos_inst = np.random.randn(n_pos, 2) + np.array([2, 2])
-            instances.append(pos_inst)
-            # Remaining negative
-            if n_instances - n_pos > 0:
-                neg_inst = np.random.randn(n_instances - n_pos, 2) + np.array([-2, -2])
-                instances.append(neg_inst)
-        else:
-            # All negative
-            instances.append(np.random.randn(n_instances, 2) + np.array([-2, -2]))
+        if self.verbose:
+            print(f"Initial J+ size: {len(J_plus)}, J- size: {len(J_minus)}")
+        
+        # Main iteration loop
+        for iteration in range(self.max_iter):
+            # Step 1: Solve optimization problem
+            v, gamma = solve_mi_spsvm_qp(X, J_plus, J_minus, self.C)
             
-        bag_data = np.vstack(instances)
-        bags.append(bag_data)
-        labels.append(label)
+            self.history.append({
+                'iter': iteration,
+                'J_plus_size': len(J_plus),
+                'J_minus_size': len(J_minus)
+            })
+            
+            # Step 2: Stopping criterion
+            # For each positive bag i, find witness j*_i = argmax_{j in J+_i ∩ J+} (v^T x_j - gamma)
+            # Let J* = {j*_i | v^T x_{j*_i} - gamma <= -1}
+            # Let J_bar = {j in J+ \ J* | v^T x_j - gamma <= -1}
+            # If J_bar = empty, STOP
+            
+            J_star: list[int] = []
+            J_bar: list[int] = []
+            
+            for bag_id in pos_bags:
+                # Get instances in this bag that are still in J+
+                bag_instances_in_Jplus = [j for j in J_plus if int(instance_bag[j]) == bag_id]
+                
+                if not bag_instances_in_Jplus:
+                    continue
+                
+                # Find witness: instance with max score
+                scores = [float(v @ X[j] - gamma) for j in bag_instances_in_Jplus]
+                max_idx = int(np.argmax(scores))
+                j_star = bag_instances_in_Jplus[max_idx]
+                
+                # Check if witness is misclassified
+                if scores[max_idx] <= -1:
+                    J_star.append(j_star)
+            
+            # J_bar = instances in J+ (not in J*) with score <= -1
+            for j in J_plus:
+                if j not in J_star:
+                    score = float(v @ X[j] - gamma)
+                    if score <= -1:
+                        J_bar.append(j)
+            
+            if self.verbose:
+                print(f"Iter {iteration}: |J*|={len(J_star)}, |J_bar|={len(J_bar)}")
+            
+            # Stopping criterion
+            if len(J_bar) == 0:
+                if self.verbose:
+                    print(f"Converged at iteration {iteration}")
+                break
+            
+            # Step 3: Update J+ and J-
+            # J+ := J+ \ J_bar
+            # J- := J- ∪ J_bar
+            J_plus = [j for j in J_plus if j not in J_bar]
+            J_minus = J_minus + J_bar
         
-    return bags, np.array(labels)
+        self.v = v
+        self.gamma = gamma
+        
+        return self
+    
+    def decision_function(self, X: Matrix) -> Vector:
+        """Compute decision function value: v^T x - gamma."""
+        if self.v is None:
+            raise ValueError("Model not fitted")
+        return cast(Vector, X @ self.v - self.gamma)
+    
+    def predict_bags(self, X: Matrix, instance_bag: Vector, n_bags: int) -> Vector:
+        """Predict bag labels using max-aggregation."""
+        if self.v is None:
+            raise ValueError("Model not fitted")
+        
+        scores = self.decision_function(X)
+        predictions = np.zeros(n_bags)
+        
+        for bag_id in range(1, n_bags + 1):
+            bag_mask = instance_bag.flatten() == bag_id
+            bag_scores = scores[bag_mask]
+            if len(bag_scores) > 0:
+                predictions[bag_id - 1] = 1 if np.max(bag_scores) > 0 else -1
+            else:
+                predictions[bag_id - 1] = -1
+        
+        return predictions
+
+
+def plot_results(
+    X: Matrix,
+    instance_bag: Vector,
+    bag_labels: Vector,
+    model: MiSPSVM,
+    save_path: str = 'mi_spsvm_results.png'
+) -> None:
+    """
+    Plot the results according to project specification:
+    - Instances colored by bag (filled for positive, unfilled for negative)
+    - Separating hyperplane H(v, gamma): v^T x = gamma
+    - Margin hyperplanes H+: v^T x = gamma + 1 and H-: v^T x = gamma - 1
+    """
+    if model.v is None:
+        raise ValueError("Model not fitted")
+    
+    v = model.v
+    gamma = model.gamma
+    
+    plt.figure(figsize=(12, 10))
+    
+    # Color palette for bags
+    cmap = plt.colormaps.get_cmap('tab10')  # type: ignore[attr-defined]
+    colors = [cmap(i) for i in np.linspace(0, 1, 10)]
+    
+    n_bags = len(bag_labels)
+    
+    # Plot instances
+    for bag_id in range(1, n_bags + 1):
+        bag_mask = instance_bag.flatten() == bag_id
+        bag_X = X[bag_mask]
+        label = bag_labels[bag_id - 1]
+        color = colors[bag_id - 1]
+        
+        if label == 1:
+            # Positive bag: filled circles
+            plt.scatter(
+                bag_X[:, 0], bag_X[:, 1],
+                c=[color], marker='o', s=100,
+                edgecolors='black', linewidths=1.5,
+                label=f'Bag {bag_id} (+)'
+            )
+        else:
+            # Negative bag: unfilled circles
+            plt.scatter(
+                bag_X[:, 0], bag_X[:, 1],
+                facecolors='none', edgecolors=color,
+                marker='o', s=100, linewidths=2,
+                label=f'Bag {bag_id} (-)'
+            )
+    
+    # Plot hyperplanes
+    x_min, x_max = X[:, 0].min() - 50, X[:, 0].max() + 50
+    
+    # H(v, gamma): v1*x1 + v2*x2 = gamma  =>  x2 = (gamma - v1*x1) / v2
+    if abs(v[1]) > 1e-10:
+        x1_line = np.linspace(x_min, x_max, 100)
+        
+        # Separating hyperplane
+        x2_sep = (gamma - v[0] * x1_line) / v[1]
+        plt.plot(x1_line, x2_sep, 'k-', linewidth=2, label=r'$H(v,\gamma): v^T x = \gamma$')
+        
+        # H+: v^T x = gamma + 1
+        x2_plus = (gamma + 1 - v[0] * x1_line) / v[1]
+        plt.plot(x1_line, x2_plus, 'b--', linewidth=1.5, label=r'$H^+: v^T x = \gamma + 1$')
+        
+        # H-: v^T x = gamma - 1
+        x2_minus = (gamma - 1 - v[0] * x1_line) / v[1]
+        plt.plot(x1_line, x2_minus, 'r--', linewidth=1.5, label=r'$H^-: v^T x = \gamma - 1$')
+    
+    # Set axis limits
+    y_min, y_max = X[:, 1].min() - 50, X[:, 1].max() + 50
+    plt.xlim(x_min, x_max)
+    plt.ylim(y_min, y_max)
+    
+    plt.xlabel('$x_1$', fontsize=12)
+    plt.ylabel('$x_2$', fontsize=12)
+    plt.title('mi-SPSVM Results', fontsize=14)
+    plt.legend(loc='best', fontsize=9)
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    print(f"Plot saved to {save_path}")
+
+
+def compute_training_correctness(
+    predictions: Vector,
+    true_labels: Vector
+) -> float:
+    """Compute training correctness (accuracy)."""
+    return float(np.mean(predictions == true_labels))
 
 
 def main() -> None:
-    # 1. Generate Data
-    bags, y = generate_data(n_bags=50)
+    """Main function to run mi-SPSVM on the provided dataset."""
     
-    # 2. Train
-    print("Training MI-SPSVM...")
-    model = MISPSVM(C=1.0, verbose=True)
-    model.fit(bags, y)
-    
-    # 3. Predict / Test
-    y_pred = model.predict_bag(bags)
-    acc = np.mean(y_pred == y)
-    print(f"Training Accuracy: {acc * 100:.2f}%")
-    
-    if acc < 0.5:
-        print("Error: Accuracy too low, something is wrong.")
+    # Load dataset
+    print("Loading dataset...")
+    try:
+        data = load_octave_mat('dataset79MIL.mat')
+    except FileNotFoundError:
+        print("Error: dataset79MIL.mat not found!")
         sys.exit(1)
-        
-    # 4. Plot
-    print("Plotting results...")
-    plt.figure(figsize=(10, 8))
     
-    # Collect all points for background limits
-    all_X = np.vstack(bags)
-    x_min, x_max = all_X[:, 0].min() - 1, all_X[:, 0].max() + 1
-    y_min, y_max = all_X[:, 1].min() - 1, all_X[:, 1].max() + 1
-    xx, yy = np.meshgrid(np.arange(x_min, x_max, 0.1),
-                         np.arange(y_min, y_max, 0.1))
+    X = data['X']  # (35, 2)
+    instance_bag = data['instanceBag'].flatten()  # (35,)
+    y = data['y'].flatten()  # (7,)
     
-    # Plot decision boundary
-    # We need to reshape grid for decision_function
-    grid_points = np.c_[xx.ravel(), yy.ravel()]
-    # Use the underlying SVM to predict
-    Z = model.svm.decision_function(grid_points)
-    Z = Z.reshape(xx.shape)
+    print(f"Dataset: {X.shape[0]} instances, {len(y)} bags")
+    print(f"Positive bags: {np.sum(y == 1)}, Negative bags: {np.sum(y == -1)}")
     
-    plt.contourf(xx, yy, Z, levels=[-100, 0, 100], alpha=0.2, colors=['red', 'blue'])
-    plt.contour(xx, yy, Z, levels=[0], colors='k', linewidths=2)
+    # Train model
+    print("\nTraining mi-SPSVM...")
+    model = MiSPSVM(C=1.0, verbose=True)
+    model.fit(X, instance_bag, y)
     
-    # Plot bags
-    # Positive bags - plot instances
-    # We color instances by their ground truth potential (heuristic based on location)
-    # to see if the algorithm picked the right ones.
+    print("\nLearned parameters:")
+    print(f"  v = {model.v}")
+    print(f"  gamma = {model.gamma:.6f}")
     
-    for i, (bag, label) in enumerate(zip(bags, y)):
-        if label == 1:
-            plt.scatter(bag[:, 0], bag[:, 1], c='blue', marker='o', alpha=0.6, s=30, label='Pos Bag' if i == 0 else "")
-            # Verify which was chosen as witness (highest score)
-            scores = model.svm.decision_function(bag)
-            max_idx = np.argmax(scores)
-            plt.scatter(bag[max_idx, 0], bag[max_idx, 1], c='cyan', marker='*', s=100, edgecolors='k', label='Witness' if i == 0 else "")
-        else:
-            plt.scatter(bag[:, 0], bag[:, 1], c='red', marker='x', alpha=0.6, s=30, label='Neg Bag' if i == 0 else "")
+    # Predict and compute training correctness
+    predictions = model.predict_bags(X, instance_bag, len(y))
+    accuracy = compute_training_correctness(predictions, y)
+    
+    print(f"\nTraining Correctness: {accuracy * 100:.2f}%")
+    print(f"Predictions: {predictions.astype(int)}")
+    print(f"True labels: {y.astype(int)}")
+    
+    # Plot results
+    print("\nGenerating plot...")
+    plot_results(X, instance_bag, y, model)
+    
+    print("\nSuccess!")
 
-    # Clean up legend
-    handles, labels_legend = plt.gca().get_legend_handles_labels()
-    by_label = dict(zip(labels_legend, handles))
-    plt.legend(by_label.values(), by_label.keys())
-    
-    plt.title(f'MI-SPSVM Results (Acc: {acc*100:.1f}%)')
-    plt.savefig('mi_spsvm_results.png')
-    print("Plot saved to mi_spsvm_results.png")
-    print("Success")
 
 if __name__ == "__main__":
     main()
